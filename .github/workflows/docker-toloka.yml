@@ -80,10 +80,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Tag and push (only after smoke test passes)
+      # Re-run the build with push enabled — a full cache hit (nothing rebuilds),
+      # it just pushes. Avoids shell-quoting the multiline tags list.
+      - name: Push (only after smoke test passes)
         if: success()
-        run: |
-          for tag in ${{ steps.meta.outputs.tags }}; do
-            docker tag prowlarr-toloka:ci "$tag"
-            docker push "$tag"
-          done
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.toloka
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

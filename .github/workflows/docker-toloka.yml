@@ -1,0 +1,56 @@
+name: Docker (Toloka)
+
+# Builds the Toloka-enhanced Prowlarr overlay image and publishes it to GHCR.
+# First run creates ghcr.io/<owner>/prowlarr-toloka — make the package Public in
+# GitHub → Packages → Package settings if you want others to pull without a token.
+
+on:
+  push:
+    branches: [ feature/toloka-enhancements ]
+    paths:
+      - 'src/NzbDrone.Core/**'
+      - 'docker/Dockerfile.toloka**'
+      - '.github/workflows/docker-toloka.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/prowlarr-toloka
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.toloka
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

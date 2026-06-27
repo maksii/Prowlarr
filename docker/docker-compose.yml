@@ -1,0 +1,26 @@
+# Toloka-enhanced Prowlarr — local test / sharing.
+#
+# Pull the CI-published image and run it just like the official LinuxServer image.
+# Config persists in ./config (Prowlarr config.db, indexer settings, etc.).
+#
+#   docker compose -f docker/docker-compose.yml up -d
+#   # open http://localhost:9696 → Indexers → Add → "Toloka"
+#
+# To build & run locally instead of pulling, comment out `image:` and uncomment
+# the `build:` block below.
+services:
+  prowlarr-toloka:
+    image: ghcr.io/maksii/prowlarr-toloka:latest
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile.toloka
+    container_name: prowlarr-toloka
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./config:/config
+    ports:
+      - "9696:9696"
+    restart: unless-stopped

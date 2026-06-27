@@ -1,0 +1,12 @@
+.git
+.github
+_output
+_temp
+_tests
+frontend
+**/bin
+**/obj
+**/node_modules
+**/.vs
+**/*.user
+docker

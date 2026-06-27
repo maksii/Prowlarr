@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+#
+# Toloka-enhanced Prowlarr — overlay image.
+#
+# Compiles Prowlarr.Core.dll (which contains the enhanced Toloka indexer +
+# TolokaTitleParser) from THIS branch, then drops that single managed assembly
+# onto the official LinuxServer.io Prowlarr image. The result is byte-identical to
+# upstream Prowlarr except for the Toloka indexer — same config dir, port, UI, etc.
+#
+# Why this works: Prowlarr.Core.dll is platform-agnostic IL, so it runs fine on the
+# musl/Alpine LSIO base, and we don't have to rebuild the React frontend (untouched).
+# BASE_TAG is pinned to the exact upstream version this branch is based on
+# (v2.5.0.5422 = the 'nightly'/develop channel), so the swapped DLL is ABI-compatible
+# with every sibling assembly already in the image.
+#
+# Build (context = repo root):
+#   docker build -f docker/Dockerfile.toloka -t prowlarr-toloka .
+#
+# When you rebase onto a newer upstream Prowlarr, bump BASE_TAG to the matching
+# LinuxServer tag (https://hub.docker.com/r/linuxserver/prowlarr/tags).
+ARG BASE_TAG=nightly-2.5.0.5422-ls3
+
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+COPY . .
+# Backend-only build of the changed assembly. RunAnalyzers=false avoids StyleCop
+# failing the build under a newer SDK; the frontend is not needed for Core.
+RUN dotnet build src/NzbDrone.Core/Prowlarr.Core.csproj \
+        -c Release \
+        -p:RunAnalyzers=false \
+        -p:TreatWarningsAsErrors=false \
+        -o /out
+
+FROM lscr.io/linuxserver/prowlarr:${BASE_TAG}
+LABEL org.opencontainers.image.title="Prowlarr (Toloka-enhanced)" \
+      org.opencontainers.image.description="LinuxServer Prowlarr with the enhanced Toloka.to indexer" \
+      org.opencontainers.image.source="https://github.com/maksii/Prowlarr"
+COPY --from=build /out/Prowlarr.Core.dll /app/prowlarr/bin/Prowlarr.Core.dll

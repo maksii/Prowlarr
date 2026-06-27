@@ -1,8 +1,9 @@
 name: Docker (Toloka)
 
-# Builds the Toloka-enhanced Prowlarr overlay image and publishes it to GHCR.
-# First run creates ghcr.io/<owner>/prowlarr-toloka — make the package Public in
-# GitHub → Packages → Package settings if you want others to pull without a token.
+# Builds the Toloka-enhanced Prowlarr overlay image, BOOTS it as a smoke test, and
+# only publishes to GHCR if it starts cleanly. First run creates
+# ghcr.io/<owner>/prowlarr-toloka — make the package Public in
+# GitHub → Packages → Package settings to let others pull without a token.
 
 on:
   push:
@@ -28,13 +29,6 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -44,13 +38,52 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
-      - name: Build and push
+      # Build once, load into the local docker so we can boot it before publishing.
+      - name: Build (load locally)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile.toloka
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          tags: prowlarr-toloka:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke test (boot the container)
+        run: |
+          set -e
+          docker run -d --name pw -p 9696:9696 prowlarr-toloka:ci
+          ok=""
+          for i in $(seq 1 40); do
+            logs="$(docker logs pw 2>&1 || true)"
+            if echo "$logs" | grep -qiE "EPIC FAIL|Unhandled exception|FileNotFoundException"; then
+              echo "::error::Prowlarr failed to start"; echo "$logs" | tail -40; exit 1
+            fi
+            if echo "$logs" | grep -qiE "Listening on the following URLs|Now listening on"; then
+              ok=1; echo "Prowlarr started cleanly"; break
+            fi
+            if [ -z "$(docker ps -q -f name=pw)" ]; then
+              echo "::error::container exited"; docker logs pw | tail -40; exit 1
+            fi
+            sleep 3
+          done
+          if [ -z "$ok" ]; then echo "::error::timed out waiting for startup"; docker logs pw | tail -40; exit 1; fi
+          # Confirm the Toloka indexer definition is present in the running image.
+          docker logs pw | tail -15
+          docker rm -f pw >/dev/null 2>&1 || true
+
+      - name: Log in to GHCR
+        if: success()
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push (only after smoke test passes)
+        if: success()
+        run: |
+          for tag in ${{ steps.meta.outputs.tags }}; do
+            docker tag prowlarr-toloka:ci "$tag"
+            docker push "$tag"
+          done

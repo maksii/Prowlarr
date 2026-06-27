@@ -1,49 +1,49 @@
 # syntax=docker/dockerfile:1
 #
-# Toloka-enhanced Prowlarr — overlay image.
+# Toloka-enhanced Prowlarr — full-backend overlay image.
 #
-# Compiles Prowlarr.Core.dll (which contains the enhanced Toloka indexer +
-# TolokaTitleParser) from THIS branch, then drops that single managed assembly
-# onto the official LinuxServer.io Prowlarr image. The result is byte-identical to
-# upstream Prowlarr except for the Toloka indexer — same config dir, port, UI, etc.
+# Prowlarr's official build (and therefore the LinuxServer image) is a SELF-CONTAINED
+# .NET publish — the image installs NO shared runtime, it runs entirely off the
+# bundled payload in /app/prowlarr/bin. That makes a single-DLL swap impossible: the
+# app's .deps.json describes the whole original assembly closure, so dropping in one
+# rebuilt Prowlarr.Core.dll breaks assembly resolution at startup.
 #
-# Why this works: Prowlarr.Core.dll is platform-agnostic IL, so it runs fine on the
-# musl/Alpine LSIO base, and we don't have to rebuild the React frontend (untouched).
-# BASE_TAG is pinned to the exact upstream version this branch is based on
-# (v2.5.0.5422 = the 'nightly'/develop channel), so the swapped DLL is ABI-compatible
-# with every sibling assembly already in the image.
+# Instead we rebuild the ENTIRE managed backend from this branch — exactly the way
+# upstream's build.sh does (self-contained publish of Prowlarr.sln for the image's
+# RID) — and overlay that coherent app folder onto the image's bin. The React
+# frontend is untouched, so no yarn build is needed: we reuse the image's UI/ folder.
 #
 # Build (context = repo root):
 #   docker build -f docker/Dockerfile.toloka -t prowlarr-toloka .
 #
-# When you rebase onto a newer upstream Prowlarr, bump BASE_TAG to the matching
-# LinuxServer tag (https://hub.docker.com/r/linuxserver/prowlarr/tags).
+# Pin PROWLARR_VERSION to the upstream build number baked into the base image
+# (10.0.0.34982 here) so the rebuilt backend reports the same version as the bundled
+# UI. Bump BASE_TAG + PROWLARR_VERSION together when you rebase.
 ARG BASE_TAG=nightly-2.5.0.5422-ls3
-# Upstream versions Prowlarr assemblies with a wildcard (10.0.0.*) that resolves to
-# a single number per CI build — 10.0.0.34982 in this base image. The rebuilt
-# Prowlarr.Core.dll must carry that SAME identity (and reference Prowlarr.Common at
-# it) or the assembly load fails. Read it from a failing container's startup error
-# ("Prowlarr.Common, Version=10.0.0.XXXXX") and bump alongside BASE_TAG.
-ARG CORE_ASSEMBLY_VERSION=10.0.0.34982
+ARG PROWLARR_VERSION=10.0.0.34982
 
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-ARG CORE_ASSEMBLY_VERSION
+ARG PROWLARR_VERSION
 WORKDIR /src
 COPY . .
-# Backend-only build of the changed assembly. RunAnalyzers=false avoids StyleCop
-# failing the build under a newer SDK; the frontend is not needed for Core.
-# Pin AssemblyVersion so Prowlarr.Core.dll and its Prowlarr.Common reference match
-# the assemblies already in the image.
-RUN dotnet build src/NzbDrone.Core/Prowlarr.Core.csproj \
-        -c Release \
-        -p:AssemblyVersion=${CORE_ASSEMBLY_VERSION} \
-        -p:FileVersion=${CORE_ASSEMBLY_VERSION} \
+# Pin the wildcard assembly version (upstream uses 10.0.0.* → a per-build number).
+RUN sed -i "s|<AssemblyVersion>[0-9.*]\+</AssemblyVersion>|<AssemblyVersion>${PROWLARR_VERSION}</AssemblyVersion>|g" src/Directory.Build.props
+# Self-contained backend publish for the image's RID (musl x64), mirroring build.sh.
+# Output lands in _output/net8.0/linux-musl-x64/publish — a complete app folder
+# (all DLLs incl. the runtime, deps.json, runtimeconfig, apphost). No frontend.
+RUN dotnet msbuild -restore src/Prowlarr.sln \
+        -p:Configuration=Release \
+        -p:Platform=Posix \
+        -p:SelfContained=true \
+        -p:RuntimeIdentifiers=linux-musl-x64 \
         -p:RunAnalyzers=false \
         -p:TreatWarningsAsErrors=false \
-        -o /out
+        -t:PublishAllRids
 
 FROM lscr.io/linuxserver/prowlarr:${BASE_TAG}
 LABEL org.opencontainers.image.title="Prowlarr (Toloka-enhanced)" \
       org.opencontainers.image.description="LinuxServer Prowlarr with the enhanced Toloka.to indexer" \
       org.opencontainers.image.source="https://github.com/maksii/Prowlarr"
-COPY --from=build /out/Prowlarr.Core.dll /app/prowlarr/bin/Prowlarr.Core.dll
+# Overlay the coherent backend; the image's UI/, s6 init and config are untouched
+# (COPY merges, so /app/prowlarr/bin/UI from the base image is preserved).
+COPY --from=build /src/_output/net8.0/linux-musl-x64/publish/ /app/prowlarr/bin/

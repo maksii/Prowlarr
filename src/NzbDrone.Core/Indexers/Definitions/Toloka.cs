@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using AngleSharp.Html.Parser;
+using Newtonsoft.Json.Linq;
 using NLog;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http;
@@ -92,7 +93,6 @@ namespace NzbDrone.Core.Indexers.Definitions
 
             var requestBuilder = new HttpRequestBuilder(loginUrl)
             {
-                LogResponseContent = true,
                 AllowAutoRedirect = true
             };
 
@@ -296,14 +296,19 @@ namespace NzbDrone.Core.Indexers.Definitions
             caps.Categories.AddCategoryMapping("236", NewznabStandardCategory.Other, "Закритий розділ");
             // Archive: still-valid releases relocated here, usually because a newer version superseded them elsewhere.
             caps.Categories.AddCategoryMapping("71", NewznabStandardCategory.Other, "Архіви");
-            caps.Categories.AddCategoryMapping("72", NewznabStandardCategory.Other, "Архів відео");
+            // Archived video is a mix of movies and TV; map to BOTH so the title reconstruction runs (it is gated on
+            // a TV/Movies category) and both Sonarr and Radarr can discover it (same dual-mapping as forum 137).
+            caps.Categories.AddCategoryMapping("72", NewznabStandardCategory.Movies, "Архів відео");
+            caps.Categories.AddCategoryMapping("72", NewznabStandardCategory.TV, "Архів відео");
             caps.Categories.AddCategoryMapping("73", NewznabStandardCategory.Other, "Архів музики");
             caps.Categories.AddCategoryMapping("74", NewznabStandardCategory.Other, "Архів програм");
             caps.Categories.AddCategoryMapping("75", NewznabStandardCategory.Other, "Архів ігор");
             caps.Categories.AddCategoryMapping("76", NewznabStandardCategory.Other, "Архів літератури");
             // Unformatted: flagged for a description/formatting violation (often just a missing poster); the file itself may be fine.
             caps.Categories.AddCategoryMapping("121", NewznabStandardCategory.Other, "Неоформлені");
-            caps.Categories.AddCategoryMapping("45", NewznabStandardCategory.Other, "Неоформлене відео");
+            // Unformatted video is also a movie/TV mix - map to BOTH so reconstruction runs (mirrors forum 72).
+            caps.Categories.AddCategoryMapping("45", NewznabStandardCategory.Movies, "Неоформлене відео");
+            caps.Categories.AddCategoryMapping("45", NewznabStandardCategory.TV, "Неоформлене відео");
             caps.Categories.AddCategoryMapping("46", NewznabStandardCategory.Other, "Неоформлена музика");
             caps.Categories.AddCategoryMapping("47", NewznabStandardCategory.Other, "Неоформлене програмне забезпечення");
             caps.Categories.AddCategoryMapping("48", NewznabStandardCategory.Other, "Неоформлені ігри");
@@ -404,24 +409,6 @@ namespace NzbDrone.Core.Indexers.Definitions
                 parameters.Add("sds", "1");
             }
 
-            if (_settings.SearchByUploader.IsNotNullOrWhiteSpace())
-            {
-                // Toloka's "Автор" search field is "pn" (poster NAME = username, what users actually know). The
-                // legacy numeric poster id is "pid" (the value behind an uploader-name link). A purely numeric value
-                // is treated as a pid for backward compatibility; anything else is a username. Homoglyph-normalize
-                // the username so a handle with Cyrillic look-alikes hidden among Latin letters (e.g. "wаrden", the
-                // 'а' is Cyrillic) still matches the real account — same treatment titles get.
-                var uploader = _settings.SearchByUploader.Trim();
-                if (uploader.All(char.IsDigit))
-                {
-                    parameters.Add("pid", uploader);
-                }
-                else
-                {
-                    parameters.Add("pn", TolokaTitleParser.NormalizeNameHomoglyphs(uploader));
-                }
-            }
-
             var queryCats = _capabilities.Categories.MapTorznabCapsToTrackers(categories);
             if (queryCats.Any())
             {
@@ -449,8 +436,14 @@ namespace NzbDrone.Core.Indexers.Definitions
 
     public class TolokaParser : IParseIndexerResponse
     {
-        // Hard cap on how many releases we enrich with a details-page request, to keep searches responsive.
-        private const int MaxEnhancedMetadataRequests = 30;
+        // Hard cap on how many releases we enrich with a details-page request, to keep searches responsive and avoid
+        // tripping Toloka's rate limit (each enrichment is one extra, throttled request).
+        private const int MaxEnhancedMetadataRequests = 10;
+
+        // Per-request rate limit (seconds) for the sequential details-page fetches, so a search doesn't hammer Toloka
+        // into a 429 (the manual enrichment requests bypass the indexer's pipeline rate limit). ~2s is what the site
+        // tolerates.
+        private const double EnhancedMetadataRateLimitSeconds = 2;
 
         private readonly TolokaSettings _settings;
         private readonly IndexerCapabilitiesCategories _categories;
@@ -535,7 +528,7 @@ namespace NzbDrone.Core.Indexers.Definitions
 
                     // In magnet mode the download URL points at the details page; Download() resolves the magnet.
                     DownloadUrl = _settings.UseMagnetLinks ? infoUrl : _settings.BaseUrl + downloadUrl,
-                    Title = _titleParser.Parse(title, categories, _settings.StripCyrillicLetters, releaseGroup, ukrainianAudioDefault, _settings.PreserveExactRanges),
+                    Title = _titleParser.Parse(title, categories, _settings.StripCyrillicLetters, releaseGroup, ukrainianAudioDefault, _settings.PreserveExactRanges, _settings.NormalizeQuality),
                     Description = title,
                     Categories = categories,
                     Seeders = seeders,
@@ -565,12 +558,107 @@ namespace NzbDrone.Core.Indexers.Definitions
                 releaseInfos.Add(release);
             }
 
+            // Merge the completed/grabs count from the JSON api.php search (the HTML search page shows "?" for it).
+            if (_settings.FetchGrabs)
+            {
+                MergeGrabs(releaseInfos, indexerResponse);
+            }
+
             if (_settings.EnhancedMetadata)
             {
                 EnrichReleases(releaseInfos);
             }
 
             return releaseInfos.ToArray();
+        }
+
+        // api.php returns up to ~30 JSON search hits that DO include the completed/grabs count the HTML search page
+        // hides (it shows "?"). One extra request (first page of a search only) merges that count in by topic id.
+        private void MergeGrabs(List<ReleaseInfo> releases, IndexerResponse indexerResponse)
+        {
+            try
+            {
+                var requestUrl = indexerResponse.Request.Url.FullUri;
+                var term = ParseUtil.GetArgumentFromQueryString(requestUrl, "nm");
+                var start = ParseUtil.GetArgumentFromQueryString(requestUrl, "start");
+
+                // The api needs a search term; only do it once per search (skip paged requests beyond the first).
+                if (term.IsNullOrWhiteSpace() || start.IsNotNullOrWhiteSpace())
+                {
+                    return;
+                }
+
+                var apiUrl = $"{_settings.BaseUrl}api.php?search={Uri.EscapeDataString(term)}";
+                var request = new HttpRequestBuilder(apiUrl)
+                    .SetCookies(_getCookies() ?? new Dictionary<string, string>())
+                    .SetHeader("Referer", _settings.BaseUrl)
+                    .Accept(HttpAccept.Json)
+                    .WithRateLimit(EnhancedMetadataRateLimitSeconds)
+                    .Build();
+
+                var response = _httpClient.ExecuteProxied(request, _definition);
+                if (response.HasHttpError)
+                {
+                    return;
+                }
+
+                var grabs = ParseGrabCounts(response.Content);
+                if (grabs.Count == 0)
+                {
+                    return;
+                }
+
+                foreach (var release in releases)
+                {
+                    var id = ExtractTopicId(release.InfoUrl);
+                    if (id != null && grabs.TryGetValue(id, out var count))
+                    {
+                        release.Grabs = count;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug(ex, "Toloka: Failed to fetch download counts from api.php");
+            }
+        }
+
+        // Parses the api.php JSON array into a topic-id -> completed(grabs) map. Tolerant of an empty/non-array body
+        // (the api returns plain text on error), so a bad response simply yields no counts rather than throwing.
+        public static Dictionary<string, int> ParseGrabCounts(string json)
+        {
+            var map = new Dictionary<string, int>();
+            if (json.IsNullOrWhiteSpace() || !json.TrimStart().StartsWith("["))
+            {
+                return map;
+            }
+
+            foreach (var item in JArray.Parse(json))
+            {
+                var id = item.Value<string>("id");
+                var complete = item.Value<string>("complete");
+                if (id.IsNotNullOrWhiteSpace() && int.TryParse(complete, out var count))
+                {
+                    map[id] = count;
+                }
+            }
+
+            return map;
+        }
+
+        private static readonly Regex TopicIdRegex = new(@"/t(\d+)", RegexOptions.Compiled);
+
+        // Extracts the numeric topic id from a details URL ("https://toloka.to/t695553" -> "695553") to match the
+        // api.php "id" field.
+        private static string ExtractTopicId(string infoUrl)
+        {
+            if (infoUrl.IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            var m = TopicIdRegex.Match(infoUrl);
+            return m.Success ? m.Groups[1].Value : null;
         }
 
         // Optionally fetches each release's details page to populate IMDb id, poster and infohash. Capped and sequential
@@ -595,6 +683,7 @@ namespace NzbDrone.Core.Indexers.Definitions
                         .SetCookies(_getCookies() ?? new Dictionary<string, string>())
                         .SetHeader("Referer", _settings.BaseUrl)
                         .Accept(HttpAccept.Html)
+                        .WithRateLimit(EnhancedMetadataRateLimitSeconds)
                         .Build();
 
                     var response = _httpClient.ExecuteProxied(request, _definition);
@@ -621,6 +710,12 @@ namespace NzbDrone.Core.Indexers.Definitions
                         release.Title = InjectResolution(release.Title, meta.Resolution);
                     }
 
+                    // File count is only available on the details page (the search rows don't carry it).
+                    if (meta.FileCount is > 0)
+                    {
+                        release.Files = meta.FileCount;
+                    }
+
                     if (release is TorrentInfo torrentInfo)
                     {
                         // Set the infohash and the magnet independently: a details page can carry a usable magnet
@@ -639,7 +734,8 @@ namespace NzbDrone.Core.Indexers.Definitions
                 }
                 catch (Exception ex)
                 {
-                    _logger.Warn(ex, "Toloka: Failed to fetch enhanced metadata for {0}", release.InfoUrl);
+                    // Optional metadata - a failure (often a transient 429) must not spam the log or fail the search.
+                    _logger.Debug(ex, "Toloka: Failed to fetch enhanced metadata for {0}", release.InfoUrl);
                 }
             }
         }
@@ -690,6 +786,15 @@ namespace NzbDrone.Core.Indexers.Definitions
 
             // Recover a resolution from the MediaInfo frame-size line ("розмір кадру: 1024 х 576").
             meta.Resolution = ResolutionFromFrameSize(doc.Body?.TextContent);
+
+            // File count from the download file list ("Список файлів завантаження"): the btTbl table has a single
+            // row6 header plus one row4 per file, so the number of row4 rows is the file count. (The search-results
+            // page carries no file count, so this is the only place it can be recovered.)
+            var fileRows = doc.QuerySelector("table.btTbl")?.QuerySelectorAll("tr.row4").Length ?? 0;
+            if (fileRows > 0)
+            {
+                meta.FileCount = fileRows;
+            }
 
             return meta;
         }
@@ -783,6 +888,7 @@ namespace NzbDrone.Core.Indexers.Definitions
         public string PosterUrl { get; set; }
         public string DownloadLink { get; set; }
         public string Resolution { get; set; }
+        public int? FileCount { get; set; }
     }
 
     public class TolokaTitleParser
@@ -905,7 +1011,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             @"(?:Сезон\w*|Seasons?)\s*[:]*\s*(\d+)\s*-\s*(\d+)(?:\s*\+\s*\S+?)?\s*[,;]\s*\d+\s*(?:" + EpKeyword + @"\b(?:\s*(?:з|із|of)\s*\d+)?|(?:з|із|of)\s*\d+)",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex SeasonEpisodeRangeAfterRegex = new(
-            @"(?:Сезон\w*|Seasons?)\s*[:]*\s*(\d+)\s*[,;]\s*(\d+)\s*-\s*(\d+)\s*(?:" + EpKeyword + @"\b|(?:з|із|of)\s*\d+)",
+            @"(?:Сезон\w*|Seasons?)\s*[:]*\s*(\d+)\s*[,;]\s*(\d+)\s*-\s*(\d+)\s*(?:" + EpKeyword + @"\b|(?:з|із|of)\s*" + OfTotal + @")",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
         // Comma optional ("Сезон 1 серії 1-12" / "Сезон 1 Випуск 1-5"); the episode keyword anchors the match.
         private static readonly Regex SeasonEpisodeRangeBeforeRegex = new(
@@ -950,7 +1056,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         // Count form: "Серій N з M" / "Episodes N of M" / "Серій: N/M" = N episodes present, not "episode N".
-        private static readonly Regex TvTitleEpisodeCountRegex = new(@"\b(?:сері[йіяї]+|епізод\w*|випуск\w*|episodes?)\s*[:]*\s*(\d+)\s*(?:з|із|of|/)\s*\d+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex TvTitleEpisodeCountRegex = new(@"\b(?:сері[йіяї]+|епізод\w*|випуск\w*|episodes?)\s*[:]*\s*(\d+)\s*(?:з|із|of|/)\s*(?:\d+|[XxХх]{2,}|\?{2,})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex DigitsRegex = new(@"\d{1,4}", RegexOptions.Compiled);
 
         // Closed set of audio/subtitle language tokens used on Toloka, with an optional "Nx" multi-dub prefix
@@ -1000,7 +1106,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             ['С'] = 'C', ['Т'] = 'T', ['У'] = 'Y', ['Х'] = 'X', ['І'] = 'I', ['Ј'] = 'J', ['Ѕ'] = 'S'
         };
 
-        public string Parse(string title, ICollection<IndexerCategory> categories, bool stripCyrillicLetters = true, string releaseGroup = null, bool? ukrainianAudioDefault = null, bool exactRanges = false)
+        public string Parse(string title, ICollection<IndexerCategory> categories, bool stripCyrillicLetters = true, string releaseGroup = null, bool? ukrainianAudioDefault = null, bool exactRanges = false, bool normalizeQuality = true)
         {
             // Drop invisible/format characters (zero-width, BOM, bidi marks, Unicode tag chars) that some uploaders
             // sneak into tokens - they split a source like "W{tag}EBDLRip" and leave a stray Latin fragment.
@@ -1163,7 +1269,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             // verbatim, so normalizing there would just produce artefacts like a hyphenated "WEB-DL-x264".
             if (isReconstructable)
             {
-                title = NormalizeSourceCodec(title);
+                title = NormalizeSourceCodec(title, normalizeQuality);
             }
 
             // Reconstruct into the canonical scene shape Sonarr/Radarr expect:
@@ -1175,17 +1281,17 @@ namespace NzbDrone.Core.Indexers.Definitions
             string rebuilt = null;
             if (isReconstructable && stripCyrillicLetters)
             {
-                var stripped = NormalizeSourceCodec(_stripCyrillicRegex.Replace(title, string.Empty).Trim(' ', '-'));
+                var stripped = NormalizeSourceCodec(_stripCyrillicRegex.Replace(title, string.Empty).Trim(' ', '-'), normalizeQuality);
 
                 // Prefer the stripped form only when a genuine Latin title survives the strip; otherwise rebuild
                 // from the Cyrillic-kept title. TryBuildCleanReleaseTitle itself rejects a junk name (returns
                 // false), so even a stripped form that slips past HasLatinTitle falls through to the Cyrillic-kept
                 // rebuild rather than emitting junk.
-                if (HasLatinTitle(stripped) && TryBuildCleanReleaseTitle(stripped, isTv, out var fromStripped))
+                if (HasLatinTitle(stripped) && TryBuildCleanReleaseTitle(stripped, isTv, normalizeQuality, out var fromStripped))
                 {
                     rebuilt = fromStripped;
                 }
-                else if (TryBuildCleanReleaseTitle(title, isTv, out var fromCyrillic))
+                else if (TryBuildCleanReleaseTitle(title, isTv, normalizeQuality, out var fromCyrillic))
                 {
                     rebuilt = fromCyrillic;
                 }
@@ -1944,16 +2050,22 @@ namespace NzbDrone.Core.Indexers.Definitions
 
         // True when, after removing language/source/quality clutter, a real Latin title word remains.
         // Normalizes source/codec spellings to the tokens Sonarr/Radarr parse, before the rebuild reads them.
-        private static string NormalizeSourceCodec(string title)
+        private static string NormalizeSourceCodec(string title, bool normalizeQuality)
         {
-            title = Regex.Replace(title, @"\b-Rip\b", "Rip", RegexOptions.IgnoreCase);
-            title = Regex.Replace(title, @"\bHDTVRip\b", "HDTV", RegexOptions.IgnoreCase);
-            // "WEB-DLRip"/"WEBDLRip" is a re-encode of a WEB-DL (MediaInfo-confirmed) -> WEBRip, the bucket
-            // Sonarr/Radarr actually parse it into (the raw "WEB-DLRip" token parses as nothing).
-            title = Regex.Replace(title, @"\bWEB-?DLRip\b", "WEBRip", RegexOptions.IgnoreCase);
-            title = Regex.Replace(title, @"\bWEBDL\b", "WEB-DL", RegexOptions.IgnoreCase);
+            // Source-name normalization is what the NormalizeQuality toggle controls; skip it when the user wants
+            // Toloka's original source tokens kept.
+            if (normalizeQuality)
+            {
+                title = Regex.Replace(title, @"\b-Rip\b", "Rip", RegexOptions.IgnoreCase);
+                title = Regex.Replace(title, @"\bHDTVRip\b", "HDTV", RegexOptions.IgnoreCase);
+                // "WEB-DLRip"/"WEBDLRip" is a re-encode of a WEB-DL (MediaInfo-confirmed) -> WEBRip, the bucket
+                // Sonarr/Radarr actually parse it into (the raw "WEB-DLRip" token parses as nothing).
+                title = Regex.Replace(title, @"\bWEB-?DLRip\b", "WEBRip", RegexOptions.IgnoreCase);
+                title = Regex.Replace(title, @"\bWEBDL\b", "WEB-DL", RegexOptions.IgnoreCase);
+            }
 
             // Normalize codecs so Sonarr/Radarr recognise them (and don't mistake "AVC" for the release group).
+            // Always applied - this is codec parsing, not the source-name normalization the toggle controls.
             title = CodecAvcRegex.Replace(title, "x264");
             title = CodecHevcRegex.Replace(title, "x265");
 
@@ -2018,7 +2130,7 @@ namespace NzbDrone.Core.Indexers.Definitions
         //   "Series Title SxxExx (Year) Source Resolution Codec".
         // The season/episode token is placed right after the series name, language/subtitle clutter is
         // dropped, and only a single Latin title is kept. Returns false when there is no year to anchor on.
-        private static bool TryBuildCleanReleaseTitle(string title, bool isTv, out string result)
+        private static bool TryBuildCleanReleaseTitle(string title, bool isTv, bool normalizeQuality, out string result)
         {
             result = null;
 
@@ -2110,7 +2222,7 @@ namespace NzbDrone.Core.Indexers.Definitions
 
             // Quality comes from the tail (after the year), plus any unambiguous source token misplaced in the
             // head/name before the year ("...India Special SatRip (2011)" -> source HDTV recovered).
-            var quality = ExtractQuality(head, tail);
+            var quality = ExtractQuality(head, tail, normalizeQuality);
 
             var sb = new StringBuilder(series);
             if (isTv && !string.IsNullOrEmpty(seToken))
@@ -2274,7 +2386,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             return count;
         }
 
-        private static string ExtractQuality(string head, string tail)
+        private static string ExtractQuality(string head, string tail, bool normalizeQuality)
         {
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var tokens = new List<string>();
@@ -2284,7 +2396,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             // never mistaken for a quality token.
             foreach (Match m in SourceAnchorRegex.Matches(head))
             {
-                var token = NormalizeQualityToken(m.Value);
+                var token = NormalizeQualityToken(m.Value, normalizeQuality);
                 if (seen.Add(token))
                 {
                     tokens.Add(token);
@@ -2293,7 +2405,7 @@ namespace NzbDrone.Core.Indexers.Definitions
 
             foreach (Match m in QualityTokenRegex.Matches(tail))
             {
-                var token = NormalizeQualityToken(m.Value);
+                var token = NormalizeQualityToken(m.Value, normalizeQuality);
                 if (seen.Add(token))
                 {
                     tokens.Add(token);
@@ -2319,17 +2431,61 @@ namespace NzbDrone.Core.Indexers.Definitions
         // custom/non-standard source names; the targets are verified against the live Sonarr+Radarr QualityParser
         // regexes (see for_testing/format_lang_standardization). A source word only sets the bucket when a
         // resolution token sits beside it, so these never invent a resolution.
-        private static string NormalizeQualityToken(string token)
+        private static string NormalizeQualityToken(string token, bool normalizeQuality)
         {
             // Fold spacing/hyphens so "BD Rip", "BDRip" and "WEB-DL" share one switch key.
             var key = token.ToUpperInvariant().Replace(" ", string.Empty).Replace("-", string.Empty);
+
+            // Resolution, codec and HDR/colour tags are ALWAYS normalized - these are not the "source quality" names
+            // the NormalizeQuality toggle controls, and Sonarr/Radarr depend on them (e.g. reading a bare "AVC" as a
+            // release group, or "4K" failing to parse as 2160p).
             switch (key)
             {
                 case "4K":
                     return "2160p";
                 case "2K":
                     return "1440p";
+                case "3D":
+                    return "3D";
+                case "X264":
+                    return "x264";
+                case "X265":
+                    return "x265";
 
+                // HDR/colour markers (inert for the base quality, used by *arr custom formats) - normalize+preserve.
+                case "DV":
+                case "DOVI":
+                case "DOLBYVISION":
+                    return "DV";
+                case "HDR10+":
+                    return "HDR10+";
+                case "HDR10":
+                    return "HDR10";
+                case "HDR":
+                    return "HDR";
+                case "HLG":
+                    return "HLG";
+                case "SDR":
+                    return "SDR";
+            }
+
+            if (Regex.IsMatch(token, @"^\d+[pi]$", RegexOptions.IgnoreCase))
+            {
+                return token.ToLowerInvariant();
+            }
+
+            // Source-name normalization maps Toloka's many custom source names to the canonical token Sonarr/Radarr
+            // actually parse (verified against the live Sonarr+Radarr QualityParser regexes, see
+            // for_testing/format_lang_standardization). A source word only sets the bucket when a resolution token
+            // sits beside it, so these never invent a resolution. Skipped when the user opts to keep Toloka's
+            // original tokens (e.g. "BDRemux"/"BDRip" left verbatim).
+            if (!normalizeQuality)
+            {
+                return token;
+            }
+
+            switch (key)
+            {
                 // Blu-ray family -> the one-word "BluRay" (Sonarr does NOT parse spaced "Blu Ray"); a rip/encode
                 // shares the Bluray bucket with a full disc.
                 case "BLURAY":
@@ -2393,37 +2549,8 @@ namespace NzbDrone.Core.Indexers.Definitions
                 case "DVDREMUX":
                     return "DVD Remux";
 
-                case "3D":
-                    return "3D";
-
                 case "CAMRIP":
                     return "CAM";
-
-                case "X264":
-                    return "x264";
-                case "X265":
-                    return "x265";
-
-                // HDR/colour markers (inert for the base quality, used by *arr custom formats) - normalize+preserve.
-                case "DV":
-                case "DOVI":
-                case "DOLBYVISION":
-                    return "DV";
-                case "HDR10+":
-                    return "HDR10+";
-                case "HDR10":
-                    return "HDR10";
-                case "HDR":
-                    return "HDR";
-                case "HLG":
-                    return "HLG";
-                case "SDR":
-                    return "SDR";
-            }
-
-            if (Regex.IsMatch(token, @"^\d+[pi]$", RegexOptions.IgnoreCase))
-            {
-                return token.ToLowerInvariant();
             }
 
             // Multi-disc DVD descriptors ("16xDVD9", "DVD9+DVD5") -> the DVD source bucket.
@@ -2451,9 +2578,11 @@ namespace NzbDrone.Core.Indexers.Definitions
             }
 
             author = author.Trim();
+            // An anonymous upload still gets an explicit "-Anonymous" group (rather than no group at all) so the
+            // release title carries a consistent, parseable group token. Both the Latin and Cyrillic markers map to it.
             if (author.Equals("Anonymous", StringComparison.OrdinalIgnoreCase) || author.Equals("Анонім", StringComparison.OrdinalIgnoreCase))
             {
-                return null;
+                return "Anonymous";
             }
 
             // Fix Cyrillic homoglyphs hidden in an otherwise-Latin handle first (e.g. "Аlех" -> "Alex"), so the
@@ -2475,8 +2604,10 @@ namespace NzbDrone.Core.Indexers.Definitions
                 }
             }
 
-            // Collapse any double spaces introduced by dropped characters and trim edge whitespace.
-            var result = Regex.Replace(sb.ToString(), @"\s+", " ").Trim();
+            // A release-group token must not contain spaces - Sonarr/Radarr read everything after the final "-" in
+            // the title as the group, so a space would truncate it. Collapse internal whitespace (from a multi-word
+            // handle like "Ukr Voice Team", or a transliterated Cyrillic name) to an underscore: "Ukr_Voice_Team".
+            var result = Regex.Replace(sb.ToString().Trim(), @"\s+", "_");
             return result.Length >= 2 && result.Any(char.IsLetterOrDigit) ? result : null;
         }
 
@@ -2566,6 +2697,8 @@ namespace NzbDrone.Core.Indexers.Definitions
         {
             StripCyrillicLetters = true;
             AppendReleaseGroup = true;
+            NormalizeQuality = true;
+            FetchGrabs = true;
             MaxPages = 1;
         }
 
@@ -2578,19 +2711,22 @@ namespace NzbDrone.Core.Indexers.Definitions
         [FieldDefinition(6, Label = "Append Release Group", Type = FieldType.Checkbox, HelpText = "Append the uploader as a release group (e.g. ...WEB-DL-FanVoxUA) to improve Sonarr/Radarr matching")]
         public bool AppendReleaseGroup { get; set; }
 
-        [FieldDefinition(7, Label = "Use Magnet Links", Type = FieldType.Checkbox, HelpText = "Resolve and use magnet links instead of .torrent files (fetches the details page on download)")]
+        [FieldDefinition(7, Label = "Normalize Quality Names", Type = FieldType.Checkbox, HelpText = "Normalize source/quality names to the tokens Sonarr/Radarr parse (e.g. BDRemux -> BluRay Remux, BDRip -> BluRay). Disable to keep Toloka's original quality tokens.")]
+        public bool NormalizeQuality { get; set; }
+
+        [FieldDefinition(8, Label = "Use Magnet Links", Type = FieldType.Checkbox, HelpText = "Resolve and use magnet links instead of .torrent files (fetches the details page on download)")]
         public bool UseMagnetLinks { get; set; }
 
-        [FieldDefinition(8, Label = "Fetch Enhanced Metadata", Type = FieldType.Checkbox, HelpText = "Fetch IMDb id, poster and infohash from each release's details page. Slower: one extra request per result (capped).")]
+        [FieldDefinition(9, Label = "Fetch Enhanced Metadata", Type = FieldType.Checkbox, HelpText = "Fetch IMDb id, poster, recovered resolution and file count from each release's details page. Slower: one extra, rate-limited request per result, capped at the first 10.")]
         public bool EnhancedMetadata { get; set; }
 
-        [FieldDefinition(9, Label = "Search By Uploader", Type = FieldType.Textbox, HelpText = "Optional. Restrict searches to a specific uploader. Enter the uploader's username (e.g. fanat22012); a numeric uploader id (e.g. 889220) is also accepted.")]
-        public string SearchByUploader { get; set; }
+        [FieldDefinition(10, Label = "Fetch Download Counts", Type = FieldType.Checkbox, HelpText = "Populate the grabs/completed count via one extra api.php request per search (Toloka's HTML search page hides it; the api covers the first ~30 results of a search).")]
+        public bool FetchGrabs { get; set; }
 
-        [FieldDefinition(10, Label = "Maximum Pages", Type = FieldType.Number, HelpText = "Number of result pages to fetch (more pages = more results but slower). Default 1.")]
+        [FieldDefinition(11, Label = "Maximum Pages", Type = FieldType.Number, HelpText = "Number of result pages to fetch (more pages = more results but slower). Default 1.")]
         public int MaxPages { get; set; }
 
-        [FieldDefinition(11, Label = "Exact Episode/Season Ranges", Type = FieldType.Checkbox, HelpText = "Show exact ranges for disjoint packs (e.g. E01-E02, E05-E12) instead of a single envelope range (E01-E12). More truthful for the user; Sonarr still treats it as the first-to-last span.")]
+        [FieldDefinition(12, Label = "Exact Episode/Season Ranges", Type = FieldType.Checkbox, HelpText = "Show exact ranges for disjoint packs (e.g. E01-E02, E05-E12) instead of a single envelope range (E01-E12). More truthful for the user; Sonarr still treats it as the first-to-last span.")]
         public bool PreserveExactRanges { get; set; }
     }
 }

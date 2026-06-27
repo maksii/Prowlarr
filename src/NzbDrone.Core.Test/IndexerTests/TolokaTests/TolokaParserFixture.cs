@@ -22,6 +22,10 @@ namespace NzbDrone.Core.Test.IndexerTests.TolokaTests
         [TestCase("Привид в латах (1, 2 сезони) / Ghost in the Shell: Stand Alone Complex (2002-2004) BDRip 1080p 2xUkr/Jap | Sub Ukr", ExpectedResult = "Ghost in the Shell: Stand Alone Complex S01-S02 (2002-2004) BluRay 1080p Ukrainian")]
         [TestCase("Окультна Академія / Seikimatsu Occult Gakuin (Сезон 1 + 5 Спешлів) (2010) BDRip 1080p Ukr/Jap | Sub Ukr", ExpectedResult = "Seikimatsu Occult Gakuin S01 (2010) BluRay 1080p Specials Ukrainian")]
         [TestCase("Поневіряння мага Орфена / Majutsushi Orphen Hagure Tabi (сезон 1+ОВА) (2020) WEBDL 720p", ExpectedResult = "Majutsushi Orphen Hagure Tabi S01 (2020) WEB-DL 720p OVA")]
+        // Episode-count "of XX / ???" unknown-total placeholder: "Сезон 4, серії 11 з ХХ" = 11 of XX episodes (a
+        // count) -> S04E01-E11 (not S04E11); "Сезон 4, 1-11 з ???" = episodes 1-11 -> S04E01-E11 (not S01-S11).
+        [TestCase("Моє переродження в Слиз (Сезон 4, серії 11 з ХХ) / Tensei shitara Slime Datta Ken (Season 4) (2026) WEBDLRip 1080p H.265 Ukr/Jap | sub Ukr", ExpectedResult = "Tensei shitara Slime Datta Ken S04E01-E11 (2026) WEBRip 1080p x265 Ukrainian")]
+        [TestCase("Про моє переродження в слиз (Сезон 4, 1-11 з ???) / Tensei shitara Slime Datta Ken (Season 4) (2026) WEBDLRip 1080p H.264", ExpectedResult = "Tensei shitara Slime Datta Ken S04E01-E11 (2026) WEBRip 1080p x264")]
         public string parses_zero_floor_anime(string title)
         {
             return new TolokaTitleParser().Parse(title, AnimeCategory, true);
@@ -186,6 +190,39 @@ namespace NzbDrone.Core.Test.IndexerTests.TolokaTests
         }
 
         [Test]
+        public void should_normalize_source_tokens_when_quality_normalization_on()
+        {
+            // Default (toggle on): Toloka's "BDRemux" is mapped to the canonical "BluRay Remux" tier.
+            var result = new TolokaTitleParser().Parse(
+                "Дюна / Dune (2021) BDRemux 1080p H.264 Ukr/Eng | Sub Ukr",
+                MovieCategory, true, null, null, exactRanges: false, normalizeQuality: true);
+            result.Should().Be("Dune (2021) BluRay Remux 1080p x264 Ukrainian");
+        }
+
+        [Test]
+        public void should_keep_original_source_tokens_when_quality_normalization_off()
+        {
+            // Toggle off: keep Toloka's original source token ("BDRemux"); resolution + codec are still normalized.
+            var result = new TolokaTitleParser().Parse(
+                "Дюна / Dune (2021) BDRemux 1080p H.264 Ukr/Eng | Sub Ukr",
+                MovieCategory, true, null, null, exactRanges: false, normalizeQuality: false);
+            result.Should().Be("Dune (2021) BDRemux 1080p x264 Ukrainian");
+        }
+
+        [Test]
+        public void should_reconstruct_tv_season_for_archive_video_mixed_category()
+        {
+            // Archive video (forum 72) and unformatted video (45) map to BOTH Movies and TV. A TV title in that mix
+            // must still be reconstructed with its season token (it would be passed through verbatim under "Other").
+            var categories = new[] { NewznabStandardCategory.Movies, NewznabStandardCategory.TV };
+            var result = new TolokaTitleParser().Parse(
+                "Дім Давида (Сезон 2) / House of David (Season 2) WEB-DL 1080p Ukr/Eng",
+                categories, true);
+            result.Should().StartWith("House of David S02");
+            result.Should().Contain("WEB-DL 1080p");
+        }
+
+        [Test]
         public void should_pick_romaji_title_and_read_audio_when_pipe_separates_titles()
         {
             // " | " is a TITLE separator here (not the audio|sub divider): pick "Ao no Hako" and still tag Ukrainian.
@@ -194,15 +231,20 @@ namespace NzbDrone.Core.Test.IndexerTests.TolokaTests
         }
 
         [TestCase("FanVoxUA", ExpectedResult = "FanVoxUA")]
-        [TestCase("Сталь Кується", ExpectedResult = "Stal Kuietsia")]
-        [TestCase("Anonymous", ExpectedResult = null)]
+        // A transliterated multi-word Cyrillic name is also underscore-joined (no spaces in a release group).
+        [TestCase("Сталь Кується", ExpectedResult = "Stal_Kuietsia")]
+        // Anonymous uploads still get an explicit "Anonymous" group (both the Latin and Cyrillic markers).
+        [TestCase("Anonymous", ExpectedResult = "Anonymous")]
+        [TestCase("Анонім", ExpectedResult = "Anonymous")]
         [TestCase("", ExpectedResult = null)]
-        // ASCII handles keep their separators/case verbatim so they match the community custom formats.
+        // A multi-word handle has its spaces replaced with underscores (a release group token cannot contain spaces).
+        [TestCase("Ukr Voice Team", ExpectedResult = "Ukr_Voice_Team")]
+        [TestCase("Marco Polo", ExpectedResult = "Marco_Polo")]
+        // ASCII handles keep their non-space separators/case verbatim so they match the community custom formats.
         [TestCase("HaKer_256", ExpectedResult = "HaKer_256")]
         [TestCase("Romario_O", ExpectedResult = "Romario_O")]
         [TestCase("Seto.Haruki", ExpectedResult = "Seto.Haruki")]
         [TestCase("Otaku-First", ExpectedResult = "Otaku-First")]
-        [TestCase("Marco Polo", ExpectedResult = "Marco Polo")]
         [TestCase("Gwean_&_Maslinka", ExpectedResult = "Gwean_&_Maslinka")]
         // Latin handles with hidden Cyrillic homoglyphs: look-alike-normalized, NOT phonetically transliterated
         // ("х" would otherwise become "kh" -> "Alekh"; "а" stays "a").
@@ -645,6 +687,28 @@ namespace NzbDrone.Core.Test.IndexerTests.TolokaTests
             meta.InfoHash.Should().BeNull();
             meta.MagnetUrl.Should().BeNull();
             meta.PosterUrl.Should().BeNull();
+        }
+
+        [Test]
+        public void should_parse_grab_counts_from_api_json()
+        {
+            // The api.php search returns the completed/grabs count the HTML page hides ("complete").
+            const string json = @"[
+  { ""id"": ""695553"", ""title"": ""Slime S4"", ""seeders"": ""22"", ""complete"": ""117"" },
+  { ""id"": ""678039"", ""title"": ""Slime S3"", ""seeders"": ""20"", ""complete"": ""1245"" }
+]";
+            var grabs = TolokaParser.ParseGrabCounts(json);
+
+            grabs["695553"].Should().Be(117);
+            grabs["678039"].Should().Be(1245);
+        }
+
+        [Test]
+        public void should_return_no_grab_counts_for_non_json_body()
+        {
+            // The api returns plain text on error/empty - must yield no counts rather than throw.
+            TolokaParser.ParseGrabCounts("").Should().BeEmpty();
+            TolokaParser.ParseGrabCounts("Nothing found").Should().BeEmpty();
         }
     }
 }

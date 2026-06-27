@@ -19,14 +19,25 @@
 # When you rebase onto a newer upstream Prowlarr, bump BASE_TAG to the matching
 # LinuxServer tag (https://hub.docker.com/r/linuxserver/prowlarr/tags).
 ARG BASE_TAG=nightly-2.5.0.5422-ls3
+# Upstream versions Prowlarr assemblies with a wildcard (10.0.0.*) that resolves to
+# a single number per CI build — 10.0.0.34982 in this base image. The rebuilt
+# Prowlarr.Core.dll must carry that SAME identity (and reference Prowlarr.Common at
+# it) or the assembly load fails. Read it from a failing container's startup error
+# ("Prowlarr.Common, Version=10.0.0.XXXXX") and bump alongside BASE_TAG.
+ARG CORE_ASSEMBLY_VERSION=10.0.0.34982
 
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+ARG CORE_ASSEMBLY_VERSION
 WORKDIR /src
 COPY . .
 # Backend-only build of the changed assembly. RunAnalyzers=false avoids StyleCop
 # failing the build under a newer SDK; the frontend is not needed for Core.
+# Pin AssemblyVersion so Prowlarr.Core.dll and its Prowlarr.Common reference match
+# the assemblies already in the image.
 RUN dotnet build src/NzbDrone.Core/Prowlarr.Core.csproj \
         -c Release \
+        -p:AssemblyVersion=${CORE_ASSEMBLY_VERSION} \
+        -p:FileVersion=${CORE_ASSEMBLY_VERSION} \
         -p:RunAnalyzers=false \
         -p:TreatWarningsAsErrors=false \
         -o /out

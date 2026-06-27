@@ -1042,7 +1042,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
         // Singular NOUN-first "серія N з M"/"серію N з M" = the single Nth episode (an index, not a count) -> EN.
         private static readonly Regex EpisodeSingleIndexOfRegex = new(
-            @"\bсері[яю]\b\s*[:]*\s*(\d{1,3})\s*(?:з|із|of)\s+\d{1,3}\b",
+            @"\bсері[яю]\b\s*[:]*\s*(\d{1,3})\s*(?:з|із|of)\s+(?:\d{1,3}\b|[XxХх]{2,}|\?{2,})",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
         // Number-first episode COUNT with no "of" total ("13 серій", "26 епізодів", "4-серії") -> E01-N. The
         // lookbehind avoids the tail of a range ("1-4 серії"); the lookahead defers the "N серій з M" of-total form.

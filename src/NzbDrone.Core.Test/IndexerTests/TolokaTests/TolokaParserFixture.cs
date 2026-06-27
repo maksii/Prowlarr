@@ -26,6 +26,8 @@ namespace NzbDrone.Core.Test.IndexerTests.TolokaTests
         // count) -> S04E01-E11 (not S04E11); "Сезон 4, 1-11 з ???" = episodes 1-11 -> S04E01-E11 (not S01-S11).
         [TestCase("Моє переродження в Слиз (Сезон 4, серії 11 з ХХ) / Tensei shitara Slime Datta Ken (Season 4) (2026) WEBDLRip 1080p H.265 Ukr/Jap | sub Ukr", ExpectedResult = "Tensei shitara Slime Datta Ken S04E01-E11 (2026) WEBRip 1080p x265 Ukrainian")]
         [TestCase("Про моє переродження в слиз (Сезон 4, 1-11 з ???) / Tensei shitara Slime Datta Ken (Season 4) (2026) WEBDLRip 1080p H.264", ExpectedResult = "Tensei shitara Slime Datta Ken S04E01-E11 (2026) WEBRip 1080p x264")]
+        // SINGULAR "серія N з ХХ" (unknown total) stays the single Nth episode -> EN (an index, not the count above).
+        [TestCase("Нянпір / Nyanpire The Animation (серія 5 з ХХ) (2011) HDTVRip Ukr/Jap | Sub Ukr", ExpectedResult = "Nyanpire The Animation E05 (2011) HDTV Ukrainian")]
         public string parses_zero_floor_anime(string title)
         {
             return new TolokaTitleParser().Parse(title, AnimeCategory, true);

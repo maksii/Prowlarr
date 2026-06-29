@@ -162,26 +162,28 @@ namespace NzbDrone.Core.Indexers.Definitions
             caps.Categories.AddCategoryMapping("117", NewznabStandardCategory.Movies, "Українське кіно");
             caps.Categories.AddCategoryMapping("84", NewznabStandardCategory.Movies, "|-Мультфільми і казки");
             caps.Categories.AddCategoryMapping("42", NewznabStandardCategory.Movies, "|-Художні фільми");
-            caps.Categories.AddCategoryMapping("124", NewznabStandardCategory.TV, "|-Телесеріали");
-            caps.Categories.AddCategoryMapping("125", NewznabStandardCategory.TV, "|-Мультсеріали");
+            caps.Categories.AddCategoryMapping("124", NewznabStandardCategory.TVHD, "|-Телесеріали"); // TV leaf (not bare TV): default Sonarr requests {TV/SD,TV/HD}, so a bare-TV release is filtered out
+            caps.Categories.AddCategoryMapping("125", NewznabStandardCategory.TVHD, "|-Мультсеріали");
             caps.Categories.AddCategoryMapping("129", NewznabStandardCategory.Movies, "|-АртХаус");
             caps.Categories.AddCategoryMapping("219", NewznabStandardCategory.Movies, "|-Аматорське відео");
             caps.Categories.AddCategoryMapping("118", NewznabStandardCategory.Movies, "Українське озвучення");
             caps.Categories.AddCategoryMapping("16", NewznabStandardCategory.Movies, "|-Фільми");
-            caps.Categories.AddCategoryMapping("32", NewznabStandardCategory.TV, "|-Телесеріали");
+            caps.Categories.AddCategoryMapping("32", NewznabStandardCategory.TVHD, "|-Телесеріали");
             caps.Categories.AddCategoryMapping("19", NewznabStandardCategory.Movies, "|-Мультфільми");
-            caps.Categories.AddCategoryMapping("44", NewznabStandardCategory.TV, "|-Мультсеріали");
+            caps.Categories.AddCategoryMapping("44", NewznabStandardCategory.TVHD, "|-Мультсеріали");
             caps.Categories.AddCategoryMapping("127", NewznabStandardCategory.TVAnime, "|-Аніме");
+            caps.Categories.AddCategoryMapping("127", NewznabStandardCategory.MoviesOther, "|-Аніме"); // dual-map: anime films reach Radarr (movie-search)
             caps.Categories.AddCategoryMapping("55", NewznabStandardCategory.Movies, "|-АртХаус");
             caps.Categories.AddCategoryMapping("94", NewznabStandardCategory.MoviesOther, "|-Трейлери");
             caps.Categories.AddCategoryMapping("144", NewznabStandardCategory.Movies, "|-Короткометражні");
 
             caps.Categories.AddCategoryMapping("190", NewznabStandardCategory.Movies, "Українські субтитри");
             caps.Categories.AddCategoryMapping("70", NewznabStandardCategory.Movies, "|-Фільми");
-            caps.Categories.AddCategoryMapping("192", NewznabStandardCategory.TV, "|-Телесеріали");
+            caps.Categories.AddCategoryMapping("192", NewznabStandardCategory.TVHD, "|-Телесеріали");
             caps.Categories.AddCategoryMapping("193", NewznabStandardCategory.Movies, "|-Мультфільми");
-            caps.Categories.AddCategoryMapping("195", NewznabStandardCategory.TV, "|-Мультсеріали");
+            caps.Categories.AddCategoryMapping("195", NewznabStandardCategory.TVHD, "|-Мультсеріали");
             caps.Categories.AddCategoryMapping("194", NewznabStandardCategory.TVAnime, "|-Аніме");
+            caps.Categories.AddCategoryMapping("194", NewznabStandardCategory.MoviesOther, "|-Аніме"); // dual-map: anime films reach Radarr (movie-search)
             caps.Categories.AddCategoryMapping("196", NewznabStandardCategory.Movies, "|-АртХаус");
             caps.Categories.AddCategoryMapping("197", NewznabStandardCategory.Movies, "|-Короткометражні");
 
@@ -220,8 +222,9 @@ namespace NzbDrone.Core.Indexers.Definitions
             caps.Categories.AddCategoryMapping("140", NewznabStandardCategory.TVDocumentary, "|-Документальні фільми в HD");
             caps.Categories.AddCategoryMapping("120", NewznabStandardCategory.MoviesDVD, "DVD українською");
             caps.Categories.AddCategoryMapping("66", NewznabStandardCategory.MoviesDVD, "|-Художні фільми та серіали в DVD");
+            caps.Categories.AddCategoryMapping("66", NewznabStandardCategory.TVSD, "|-Художні фільми та серіали в DVD"); // films AND series -> Sonarr sees the series (DVD = SD)
             caps.Categories.AddCategoryMapping("137", NewznabStandardCategory.MoviesDVD, "|-Мультфільми та мультсеріали в DVD");
-            caps.Categories.AddCategoryMapping("137", NewznabStandardCategory.TV, "|-Мультфільми та мультсеріали в DVD");
+            caps.Categories.AddCategoryMapping("137", NewznabStandardCategory.TVSD, "|-Мультфільми та мультсеріали в DVD"); // DVD cartoon-series -> Sonarr (DVD = SD)
             caps.Categories.AddCategoryMapping("138", NewznabStandardCategory.MoviesDVD, "|-Документальні фільми в DVD");
 
             caps.Categories.AddCategoryMapping("237", NewznabStandardCategory.Movies, "Відео для мобільних (iOS, Android, Windows Phone)");
@@ -299,7 +302,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             // Archived video is a mix of movies and TV; map to BOTH so the title reconstruction runs (it is gated on
             // a TV/Movies category) and both Sonarr and Radarr can discover it (same dual-mapping as forum 137).
             caps.Categories.AddCategoryMapping("72", NewznabStandardCategory.Movies, "Архів відео");
-            caps.Categories.AddCategoryMapping("72", NewznabStandardCategory.TV, "Архів відео");
+            caps.Categories.AddCategoryMapping("72", NewznabStandardCategory.TVHD, "Архів відео");
             caps.Categories.AddCategoryMapping("73", NewznabStandardCategory.Other, "Архів музики");
             caps.Categories.AddCategoryMapping("74", NewznabStandardCategory.Other, "Архів програм");
             caps.Categories.AddCategoryMapping("75", NewznabStandardCategory.Other, "Архів ігор");
@@ -308,7 +311,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             caps.Categories.AddCategoryMapping("121", NewznabStandardCategory.Other, "Неоформлені");
             // Unformatted video is also a movie/TV mix - map to BOTH so reconstruction runs (mirrors forum 72).
             caps.Categories.AddCategoryMapping("45", NewznabStandardCategory.Movies, "Неоформлене відео");
-            caps.Categories.AddCategoryMapping("45", NewznabStandardCategory.TV, "Неоформлене відео");
+            caps.Categories.AddCategoryMapping("45", NewznabStandardCategory.TVHD, "Неоформлене відео");
             caps.Categories.AddCategoryMapping("46", NewznabStandardCategory.Other, "Неоформлена музика");
             caps.Categories.AddCategoryMapping("47", NewznabStandardCategory.Other, "Неоформлене програмне забезпечення");
             caps.Categories.AddCategoryMapping("48", NewznabStandardCategory.Other, "Неоформлені ігри");
